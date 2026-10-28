@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""serve [port]  — the diff viewer at /, its diffs under /diffs/, and /diffs as a JSON list.
+"""serve [port] [--prod-roots a,b]  — the diff viewer at /, its diffs under /diffs/, and /diffs as a JSON list.
 Reviewed files live in reviews.sqlite: GET /reviews?diff=NAME -> {path: hash}, POST /reviews
 {diff, path, hash, reviewed} marks or unmarks one. The hash is of the file's diff, so a
-regenerated diff that changes a file shows it unreviewed again."""
-import http.server, json, os, sqlite3, sys, time
+regenerated diff that changes a file shows it unreviewed again. GET /config -> {prodRoots}: the
+top-level dirs whose non-test files the viewer labels prod (all of them when none are given)."""
+import argparse, http.server, json, os, sqlite3, time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 HERE = Path(__file__).resolve().parent
 DIFFS = HERE / 'diffs'
 DB = HERE / 'reviews.sqlite'
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+ap = argparse.ArgumentParser()
+ap.add_argument('port', nargs='?', type=int, default=8765)
+ap.add_argument('--prod-roots', default='', help='comma-separated top-level dirs holding production code')
+args = ap.parse_args()
+PORT = args.port
+CONFIG = {'prodRoots': [r for r in args.prod_roots.split(',') if r]}
 
 
 def db():
@@ -40,6 +46,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         elif path == '/diffs':
             return self.send_json([{'name': p.name, 'size': p.stat().st_size, 'mtime': int(p.stat().st_mtime)}
                                    for p in sorted(DIFFS.glob('*.diff'))])
+        elif path == '/config':
+            return self.send_json(CONFIG)
         elif path == '/reviews':
             diff = parse_qs(url.query).get('diff', [''])[0]
             with db() as con:

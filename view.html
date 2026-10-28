@@ -1674,7 +1674,8 @@ const LANG_AXIS = {
   markdown: new Set(['md']),
 };
 const TEST_SEGMENTS = new Set(['tests', 'gpu_tests', 'test_support', 'testdata']);
-const PROD_ROOTS = new Set(['peacockdb-core', 'peacockdb-ffi', 'cpp']);
+// top-level dirs holding production code, from `serve --prod-roots`; empty means every non-test file
+let PROD_ROOTS = new Set();
 
 function classify(f) {
   const path = f.status === 'D' ? f.oldPath : f.path;
@@ -1684,11 +1685,11 @@ function classify(f) {
 
   // role
   const dirs = segs.slice(0, -1);
-  // test anywhere; prod only inside the engine's own trees; the rest (wiki, scripts,
-  // flatbuffers, workflows) is misc
+  // test anywhere; prod only inside the configured roots (anywhere if none); the rest
+  // (docs, scripts, workflows) is misc
   if (dirs.some((d) => TEST_SEGMENTS.has(d)) || name === 'tests.rs' || name.startsWith('test_')
     || name.endsWith('_cases.rs') || name.endsWith('_tests.rs') || name.endsWith('_test.rs') || ext === 'inc') f.role = 'test';
-  else if (PROD_ROOTS.has(segs[0])) f.role = 'prod';
+  else if (!PROD_ROOTS.size || PROD_ROOTS.has(segs[0])) f.role = 'prod';
   else f.role = 'misc';
 
   // language axis
@@ -2078,7 +2079,14 @@ function moveChange(delta) {
   if (target) panel.scrollTop = target.offsetTop - 8;
 }
 
+// serve's /config; a plain http.server has none, and the defaults stand
+const configLoaded = typeof fetch === 'undefined' ? Promise.resolve() : fetch('config')
+  .then((r) => (r.ok ? r.json() : {}))
+  .then((c) => { if (Array.isArray(c.prodRoots)) PROD_ROOTS = new Set(c.prodRoots); })
+  .catch(() => {});
+
 async function load(files, name) {
+  await configLoaded;
   state.files = files.map(classify).sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   state.cache.clear(); state.expanded.clear();
   state.diffName = name;
