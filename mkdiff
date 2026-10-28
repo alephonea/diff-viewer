@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# mkdiff [-f] [-r repo] <branch|PR#> [out.diff]
+# Full-context diff of a branch (or a PR's head) against its base, for index.html.
+# -r names the git repo to diff (default: the current directory).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+usage() { echo "usage: mkdiff [-f] [-r repo] <branch|PR#> [out.diff]" >&2; exit 2; }
+
+force=0; REPO="$PWD"
+while getopts "fr:" opt; do
+  case "$opt" in
+    f) force=1 ;;
+    r) REPO="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -ge 1 && $# -le 2 ]] || usage
+target="$1"; out="${2:-}"
+
+cd "$REPO"
+git fetch -q origin
+
+# Resolve a ref: local branch first, then origin/.
+ref_of() {
+  if git show-ref -q --verify "refs/heads/$1"; then echo "$1"
+  elif git show-ref -q --verify "refs/remotes/origin/$1"; then echo "origin/$1"
+  else echo "mkdiff: no branch $1 locally or on origin" >&2; exit 1; fi
+}
+
+if [[ "$target" =~ ^[0-9]+$ ]]; then
+  read -r base_name head_name < <(gh pr view "$target" --json baseRefName,headRefName \
+    --jq '[.baseRefName, .headRefName] | @tsv' | tr '\t' ' ')
+  base="origin/$base_name"; head="origin/$head_name"; name="$head_name"
+  git rev-parse -q --verify "$head" >/dev/null || { echo "mkdiff: PR #$target head $head not on origin" >&2; exit 1; }
+else
+  name="$target"; head="$(ref_of "$target")"
+  tip="$(git rev-parse "$head")"
+  # An open PR knows its base; otherwise the nearest other branch. A child branch cut
+  # before the tip looks like a parent by topology alone, so branches whose tip is an
+  # ancestor of the target win over ones that merely share history; master breaks ties.
+  if pr_base="$(gh pr view "$name" --json baseRefName --jq .baseRefName 2>/dev/null)" && [[ -n "$pr_base" ]]; then
+    base="origin/$pr_base"
+  elif git merge-base --is-ancestor "$tip" master; then
+    base="master"   # already merged: the diff is empty, and that is the answer
+  else
+    best=""; best_n=""; best_anc=0
+    while read -r cand; do
+      [[ "$cand" == "$head" || "$cand" == "origin/$name" || "origin/$cand" == "$head" ]] && continue
+      mb="$(git merge-base "$tip" "$cand" 2>/dev/null)" || continue
+      [[ "$mb" == "$tip" ]] && continue
+      anc=0; [[ "$mb" == "$(git rev-parse "$cand")" ]] && anc=1
+      n="$(git rev-list --count "$mb..$tip")"
+      if [[ -z "$best_n" || "$anc" -gt "$best_anc" \
+            || ( "$anc" -eq "$best_anc" && ( "$n" -lt "$best_n" || ( "$n" -eq "$best_n" && "$cand" == master ) ) ) ]]; then
+        best="$cand"; best_n="$n"; best_anc="$anc"
+      fi
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes/origin | grep -v -e '^origin$' -e '^origin/HEAD$')
+    [[ -n "$best" ]] || { echo "mkdiff: no base found for $head" >&2; exit 1; }
+    base="$best"
+  fi
+fi
+
+[[ -n "$out" ]] || out="${name//\//-}.diff"
+[[ "$out" == /* ]] || out="$HERE/diffs/$out"
+mkdir -p "$(dirname "$out")"
+if [[ -e "$out" && $force -eq 0 ]]; then
+  read -r -p "$(basename "$out") exists. Overwrite? [y/N] " yn
+  [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+fi
+
+git diff -U999999 "$base...$head" > "$out"
+n="$(git rev-list --count "$base..$head")"
+files="$(grep -c '^diff --git ' "$out" || true)"
+echo "$head vs $base: $n commits, $files files, $(du -h "$out" | cut -f1) -> $out"
+echo "http://localhost:8765/?diff=$(basename "$out")"

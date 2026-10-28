@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""serve [port]  — the diff viewer at /, its diffs under /diffs/, and /diffs as a JSON list.
+Reviewed files live in reviews.sqlite: GET /reviews?diff=NAME -> {path: hash}, POST /reviews
+{diff, path, hash, reviewed} marks or unmarks one. The hash is of the file's diff, so a
+regenerated diff that changes a file shows it unreviewed again."""
+import http.server, json, os, sqlite3, sys, time
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+HERE = Path(__file__).resolve().parent
+DIFFS = HERE / 'diffs'
+DB = HERE / 'reviews.sqlite'
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+
+
+def db():
+    con = sqlite3.connect(DB)
+    con.execute('CREATE TABLE IF NOT EXISTS reviewed (diff TEXT, path TEXT, hash TEXT, at INTEGER, PRIMARY KEY (diff, path))')
+    return con
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=str(HERE), **kw)
+
+    def send_json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        url = urlsplit(self.path)
+        path = url.path
+        if path in ('/', '/index.html'):
+            self.path = '/view.html' + self.path[len(path):]
+        elif path == '/diffs':
+            return self.send_json([{'name': p.name, 'size': p.stat().st_size, 'mtime': int(p.stat().st_mtime)}
+                                   for p in sorted(DIFFS.glob('*.diff'))])
+        elif path == '/reviews':
+            diff = parse_qs(url.query).get('diff', [''])[0]
+            with db() as con:
+                return self.send_json(dict(con.execute('SELECT path, hash FROM reviewed WHERE diff = ?', (diff,))))
+        return super().do_GET()
+
+    def do_POST(self):
+        if urlsplit(self.path).path != '/reviews':
+            return self.send_error(404)
+        try:
+            r = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+            diff, path, hash_, on = str(r['diff']), str(r['path']), str(r.get('hash', '')), bool(r['reviewed'])
+        except (ValueError, KeyError, TypeError):
+            return self.send_error(400)
+        with db() as con:
+            if on:
+                con.execute('INSERT OR REPLACE INTO reviewed VALUES (?, ?, ?, ?)', (diff, path, hash_, int(time.time())))
+            else:
+                con.execute('DELETE FROM reviewed WHERE diff = ? AND path = ?', (diff, path))
+        self.send_json({'ok': True})
+
+    def end_headers(self):
+        if self.path.endswith('.diff'):
+            self.send_header('Cache-Control', 'no-store')
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+os.chdir(HERE)
+http.server.ThreadingHTTPServer.allow_reuse_address = True
+with http.server.ThreadingHTTPServer(('127.0.0.1', PORT), Handler) as srv:
+    print(f'http://localhost:{PORT}/')
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
